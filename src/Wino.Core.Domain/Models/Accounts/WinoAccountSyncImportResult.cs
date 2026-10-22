@@ -12,6 +12,11 @@ public sealed class WinoAccountSyncImportResult
     public int RemoteMailboxCount { get; init; }
 
     /// <summary>
+    /// Number of imported mailboxes that came back with their passwords and need no sign-in.
+    /// </summary>
+    public int RestoredCredentialCount { get; init; }
+
+    /// <summary>
     /// Number of accounts whose settings, signatures or folder layout were updated from the payload.
     /// </summary>
     public int AppliedAccountDataCount { get; init; }
@@ -33,6 +38,11 @@ public sealed class WinoAccountSyncImportResult
     /// applies it on the UI thread through <see cref="Interfaces.IWinoAccountDataSyncService.ApplyAppearance"/>.
     /// </summary>
     public SyncSnapshotAppearance? Appearance { get; init; }
+
+    /// <summary>
+    /// Some imported mailbox came back without a password and has to be signed in again.
+    /// </summary>
+    public bool NeedsSignIn => ImportedMailboxCount > RestoredCredentialCount;
 
     public bool HasAnyRemoteData => HadRemotePreferences || RemoteMailboxCount > 0 || AppliedAccountDataCount > 0 || AppliedAppDataCount > 0 || Appearance != null;
 }

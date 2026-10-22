@@ -43,6 +43,7 @@ public sealed class WinoAccountDataSyncService : IWinoAccountDataSyncService
     private readonly INewThemeService? _themeService;
     private readonly IStatePersistanceService? _stateService;
     private readonly IKnownImapProviderCatalog? _providerCatalog;
+    private readonly IDavCredentialStore? _davCredentialStore;
     private readonly ILogger _logger = Log.ForContext<WinoAccountDataSyncService>();
 
     public WinoAccountDataSyncService(
@@ -58,7 +59,8 @@ public sealed class WinoAccountDataSyncService : IWinoAccountDataSyncService
         IMailCategoryService? categoryService = null,
         INewThemeService? themeService = null,
         IStatePersistanceService? stateService = null,
-        IKnownImapProviderCatalog? providerCatalog = null)
+        IKnownImapProviderCatalog? providerCatalog = null,
+        IDavCredentialStore? davCredentialStore = null)
     {
         _profileService = profileService;
         _preferencesService = preferencesService;
@@ -73,12 +75,16 @@ public sealed class WinoAccountDataSyncService : IWinoAccountDataSyncService
         _themeService = themeService;
         _stateService = stateService;
         _providerCatalog = providerCatalog;
+        _davCredentialStore = davCredentialStore;
     }
 
     public async Task<WinoAccountSyncExportResult> ExportAsync(WinoAccountSyncSelection selection, SyncSnapshotSecretPrompt? secretPrompt = null, CancellationToken cancellationToken = default)
     {
         _ = await _profileService.GetActiveAccountAsync().ConfigureAwait(false)
             ?? throw WinoAccountApiException.SignInRequired();
+
+        // Passwords never go to the service, not even encrypted.
+        selection = selection with { IncludeCredentials = false };
 
         var key = await DeriveNewKeyAsync(secretPrompt, cancellationToken).ConfigureAwait(false);
         var prepared = await PrepareExportAsync(selection).ConfigureAwait(false);
@@ -311,6 +317,11 @@ public sealed class WinoAccountDataSyncService : IWinoAccountDataSyncService
             document.MergedInboxes = ExportMergedInboxes(accounts);
             document.AccountCapabilities = ExportAccountCapabilities(accounts);
 
+            if (selection.IncludeCredentials)
+            {
+                document.AccountCredentials = await ExportAccountCredentialsAsync(accounts).ConfigureAwait(false);
+            }
+
             exportedAppDataCount += (document.Filters?.Count ?? 0) + (document.Categories?.Count ?? 0)
                 + (document.Aliases?.Count ?? 0) + (document.MergedInboxes?.Count ?? 0);
         }
@@ -323,7 +334,8 @@ public sealed class WinoAccountDataSyncService : IWinoAccountDataSyncService
                 IncludedAccounts = selection.IncludeAccounts,
                 ExportedMailboxCount = document.Mailboxes?.Count ?? 0,
                 ExportedAccountDataCount = exportedAccountDataCount,
-                ExportedAppDataCount = exportedAppDataCount
+                ExportedAppDataCount = exportedAppDataCount,
+                ExportedCredentialCount = document.AccountCredentials?.Count ?? 0
             });
     }
 
@@ -448,6 +460,45 @@ public sealed class WinoAccountDataSyncService : IWinoAccountDataSyncService
             })
             .ToList();
 
+    private async Task<List<SnapshotAccountCredentials>> ExportAccountCredentialsAsync(List<MailAccount> accounts)
+    {
+        var credentials = new List<SnapshotAccountCredentials>();
+        foreach (var account in accounts)
+        {
+            // Accounts whose stored password could not be read have no server information here.
+            if (!account.ProviderType.IsCustomMailProvider() || account.ServerInformation is not { } server)
+            {
+                continue;
+            }
+
+            var davPassword = server.CalDavPassword;
+            if (string.IsNullOrEmpty(davPassword) && _davCredentialStore != null)
+            {
+                davPassword = await _davCredentialStore.GetPasswordAsync(account.Id).ConfigureAwait(false);
+            }
+
+            if (string.IsNullOrEmpty(server.IncomingServerPassword)
+                && string.IsNullOrEmpty(server.OutgoingServerPassword)
+                && string.IsNullOrEmpty(davPassword))
+            {
+                continue;
+            }
+
+            credentials.Add(new SnapshotAccountCredentials
+            {
+                AccountAddress = account.Address,
+                ProviderType = (int)account.ProviderType,
+                IncomingServerPassword = NullIfEmpty(server.IncomingServerPassword),
+                OutgoingServerPassword = NullIfEmpty(server.OutgoingServerPassword),
+                CalDavPassword = NullIfEmpty(davPassword)
+            });
+        }
+
+        return credentials;
+    }
+
+    private static string? NullIfEmpty(string? value) => string.IsNullOrEmpty(value) ? null : value;
+
     private async Task<List<SnapshotAlias>> ExportAliasesAsync(List<MailAccount> accounts)
     {
         var aliases = new List<SnapshotAlias>();
@@ -494,6 +545,7 @@ public sealed class WinoAccountDataSyncService : IWinoAccountDataSyncService
         var importedMailboxCount = 0;
         var skippedDuplicateMailboxCount = 0;
         var remoteMailboxCount = 0;
+        var restoredCredentialCount = 0;
         var appliedAccountDataCount = 0;
         var appliedFolderConfigurationCount = 0;
         var appliedAppDataCount = 0;
@@ -532,6 +584,10 @@ public sealed class WinoAccountDataSyncService : IWinoAccountDataSyncService
                 .GroupBy(a => CreateMailboxKey(a.AccountAddress, a.ProviderType), StringComparer.Ordinal)
                 .ToDictionary(group => group.Key, group => group.Last(), StringComparer.Ordinal);
 
+            var credentialsByKey = (document.AccountCredentials ?? [])
+                .GroupBy(a => CreateMailboxKey(a.AccountAddress, a.ProviderType), StringComparer.Ordinal)
+                .ToDictionary(group => group.Key, group => group.Last(), StringComparer.Ordinal);
+
             foreach (var mailbox in orderedMailboxes)
             {
                 cancellationToken.ThrowIfCancellationRequested();
@@ -545,7 +601,16 @@ public sealed class WinoAccountDataSyncService : IWinoAccountDataSyncService
 
                 var capabilities = capabilitiesByKey.GetValueOrDefault(mailboxKey);
                 var account = CreateImportedAccount(mailbox, capabilities);
-                var serverInformation = CreateImportedServerInformation(mailbox, account, capabilities);
+                var serverInformation = CreateImportedServerInformation(mailbox, account, capabilities, credentialsByKey.GetValueOrDefault(mailboxKey));
+
+                // A mailbox restored with its password connects right away. A wrong or revoked one
+                // fails the first sync, which asks for the password like any other sign-in failure.
+                var hasRestoredCredentials = !string.IsNullOrEmpty(serverInformation?.IncomingServerPassword);
+                if (hasRestoredCredentials)
+                {
+                    account.AttentionReason = AccountAttentionReason.None;
+                    restoredCredentialCount++;
+                }
 
                 await _accountService.CreateAccountAsync(account, serverInformation).ConfigureAwait(false);
 
@@ -554,7 +619,7 @@ public sealed class WinoAccountDataSyncService : IWinoAccountDataSyncService
                     await _accountService.CreateRootAliasAsync(account.Id, account.Address).ConfigureAwait(false);
                 }
 
-                if (account.ProviderType is MailProviderType.IMAP4 or MailProviderType.POP3)
+                if (account.ProviderType is MailProviderType.IMAP4 or MailProviderType.POP3 && !hasRestoredCredentials)
                 {
                     var persistedAccount = await _accountService.GetAccountAsync(account.Id).ConfigureAwait(false);
                     if (persistedAccount != null && persistedAccount.AttentionReason != AccountAttentionReason.InvalidCredentials)
@@ -612,6 +677,7 @@ public sealed class WinoAccountDataSyncService : IWinoAccountDataSyncService
             ImportedMailboxCount = importedMailboxCount,
             SkippedDuplicateMailboxCount = skippedDuplicateMailboxCount,
             RemoteMailboxCount = remoteMailboxCount,
+            RestoredCredentialCount = restoredCredentialCount,
             AppliedAccountDataCount = appliedAccountDataCount,
             AppliedFolderConfigurationCount = appliedFolderConfigurationCount,
             AppliedAppDataCount = appliedAppDataCount,
@@ -1283,7 +1349,7 @@ public sealed class WinoAccountDataSyncService : IWinoAccountDataSyncService
             ? (AccountIntegrationSource)value
             : AccountIntegrationSource.Local;
 
-    private CustomServerInformation? CreateImportedServerInformation(UserMailboxSyncItemDto mailbox, MailAccount account, SnapshotAccountCapabilities? capabilities)
+    private CustomServerInformation? CreateImportedServerInformation(UserMailboxSyncItemDto mailbox, MailAccount account, SnapshotAccountCapabilities? capabilities, SnapshotAccountCredentials? credentials)
     {
         var providerType = (MailProviderType)mailbox.ProviderType;
         if (providerType is not (MailProviderType.IMAP4 or MailProviderType.POP3))
@@ -1307,7 +1373,7 @@ public sealed class WinoAccountDataSyncService : IWinoAccountDataSyncService
             IncomingServer = mailbox.IncomingServer?.Trim() ?? string.Empty,
             IncomingServerPort = mailbox.IncomingServerPort?.Trim() ?? string.Empty,
             IncomingServerUsername = mailbox.IncomingServerUsername?.Trim() ?? string.Empty,
-            IncomingServerPassword = string.Empty,
+            IncomingServerPassword = credentials?.IncomingServerPassword ?? string.Empty,
             IncomingServerType = providerType == MailProviderType.POP3
                 ? CustomIncomingServerType.POP3
                 : CustomIncomingServerType.IMAP4,
@@ -1320,7 +1386,7 @@ public sealed class WinoAccountDataSyncService : IWinoAccountDataSyncService
             OutgoingServer = mailbox.OutgoingServer?.Trim() ?? string.Empty,
             OutgoingServerPort = mailbox.OutgoingServerPort?.Trim() ?? string.Empty,
             OutgoingServerUsername = mailbox.OutgoingServerUsername?.Trim() ?? string.Empty,
-            OutgoingServerPassword = string.Empty,
+            OutgoingServerPassword = credentials?.OutgoingServerPassword ?? string.Empty,
             OutgoingServerSocketOption = mailbox.OutgoingServerSocketOption is int outgoingSocketOption
                 ? (ImapConnectionSecurity)outgoingSocketOption
                 : ImapConnectionSecurity.Auto,
@@ -1329,7 +1395,8 @@ public sealed class WinoAccountDataSyncService : IWinoAccountDataSyncService
                 : ImapAuthenticationMethod.Auto,
             CalDavServiceUrl = mailbox.CalDavServiceUrl?.Trim() ?? string.Empty,
             CalDavUsername = mailbox.CalDavUsername?.Trim() ?? string.Empty,
-            CalDavPassword = string.Empty,
+            // CardDAV reads this when its own store is empty and moves it there after the first sync.
+            CalDavPassword = credentials?.CalDavPassword ?? string.Empty,
             CardDavServiceUrl = cardDavServiceUrl ?? string.Empty,
             CalendarSupportMode = (ImapCalendarSupportMode)mailbox.CalendarSupportMode,
             ProxyServer = mailbox.ProxyServer?.Trim() ?? string.Empty,

@@ -16,4 +16,9 @@ public sealed class WinoAccountSyncExportResult
     /// carried by the snapshot.
     /// </summary>
     public int ExportedAppDataCount { get; init; }
+
+    /// <summary>
+    /// Number of custom mailboxes whose passwords the snapshot carries.
+    /// </summary>
+    public int ExportedCredentialCount { get; init; }
 }

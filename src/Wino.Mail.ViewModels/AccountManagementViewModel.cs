@@ -492,7 +492,7 @@ public partial class AccountManagementViewModel : AccountManagementPageViewModel
             parts.Add(Translator.WinoAccount_Management_ImportEmpty);
         }
 
-        if (result.ImportedMailboxCount > 0)
+        if (result.NeedsSignIn)
         {
             parts.Add(Translator.WinoAccount_Management_ImportReloginReminder);
         }
