@@ -50,36 +50,37 @@ public static class CalendarRailMotion
     }
 
     /// <summary>
-    /// The snap unit a released drag glides to. The velocity is projected forward, the nearest
-    /// snap unit to the projected position wins, and a fast flick that would otherwise land on
-    /// the unit it started from moves at least one snap point in its direction.
+    /// Where a rail that scrolls freely comes to rest. The month view stops wherever the movement
+    /// ends, so week rows scroll steplessly. The timed views stop on a whole day column, biased in
+    /// the direction of travel, so no column is left cut in half. Whole periods are only turned by
+    /// the arrow buttons, the keyboard and an external range change.
     /// </summary>
-    /// <param name="position">The rail position at release.</param>
-    /// <param name="startUnit">The snap unit the drag started on.</param>
-    /// <param name="velocityUnitsPerMillisecond">Signed velocity in units per millisecond; positive moves to later units.</param>
-    /// <param name="flickVelocityThreshold">The velocity, in units per millisecond, above which a release counts as a flick.</param>
-    public static int ChooseReleaseUnit(CalendarRailSpace space, double position, int startUnit, double velocityUnitsPerMillisecond, double flickVelocityThreshold)
+    public static double ChooseRestPosition(CalendarRailSpace space, double position, int direction)
     {
         ArgumentNullException.ThrowIfNull(space);
 
-        var direction = Math.Sign(velocityUnitsPerMillisecond);
-
-        if (direction == 0)
+        if (space.Axis == CalendarRailAxis.Vertical)
         {
-            direction = Math.Sign(position - startUnit);
+            return position;
         }
 
+        var before = Math.Floor(position);
+        var fraction = position - before;
+        var threshold = direction > 0 ? ForwardSnapThreshold : direction < 0 ? BackwardSnapThreshold : 0.5d;
+
+        return fraction > threshold ? before + 1d : before;
+    }
+
+    /// <summary>
+    /// The rest position of a released drag: the velocity is projected forward, so a flick keeps
+    /// gliding and a slow release stops close to where the pointer let go.
+    /// </summary>
+    /// <param name="velocityUnitsPerMillisecond">Signed velocity in units per millisecond; positive moves to later units.</param>
+    public static double ChooseReleasePosition(CalendarRailSpace space, double position, double velocityUnitsPerMillisecond)
+    {
         var projected = position + (velocityUnitsPerMillisecond * FlickProjectionMilliseconds);
-        var target = ChooseSnapUnit(space, projected, direction);
 
-        if (Math.Abs(velocityUnitsPerMillisecond) > flickVelocityThreshold && target == startUnit && direction != 0)
-        {
-            target = direction > 0
-                ? space.SnapAtOrAfter(startUnit + 1)
-                : space.SnapAtOrBefore(startUnit - 1);
-        }
-
-        return target;
+        return ChooseRestPosition(space, projected, Math.Sign(velocityUnitsPerMillisecond));
     }
 
     /// <summary>

@@ -45,7 +45,7 @@ public sealed partial class CalendarPeriodControl
     private bool _isGliding;
     private bool _isRenderingHooked;
     private double _glideFrom;
-    private int _glideTarget;
+    private double _glideTarget;
     private double _glideDurationMilliseconds;
     private int _lastWheelDirection;
     private bool _isWheelScrolling;
@@ -62,9 +62,10 @@ public sealed partial class CalendarPeriodControl
             return;
         }
 
-        var baseUnit = _isGliding
-            ? _glideTarget
-            : CalendarRailMotion.ChooseSnapUnit(space, _isWheelScrolling ? _wheelTargetPosition : _position, 0);
+        var baseUnit = CalendarRailMotion.ChooseSnapUnit(
+            space,
+            _isGliding ? _glideTarget : _isWheelScrolling ? _wheelTargetPosition : _position,
+            0);
 
         CancelPan();
         StopWheelScrolling();
@@ -117,26 +118,26 @@ public sealed partial class CalendarPeriodControl
     }
 
     /// <summary>
-    /// Eases the rail from its current position to a snap unit, or jumps there when animations are
-    /// turned off.
+    /// Eases the rail from its current position to a rest position, or jumps there when animations
+    /// are turned off.
     /// </summary>
-    private void GlideTo(int targetUnit, double durationMilliseconds)
+    private void GlideTo(double targetPosition, double durationMilliseconds)
     {
         var canAnimate = _uiSettings.AnimationsEnabled &&
                          IsLoaded &&
                          durationMilliseconds > 0d &&
-                         Math.Abs(targetUnit - _position) > PositionEpsilon;
+                         Math.Abs(targetPosition - _position) > PositionEpsilon;
 
         if (!canAnimate)
         {
             StopGlide();
-            SetRailPosition(targetUnit);
-            SettleRail(targetUnit);
+            SetRailPosition(targetPosition);
+            SettleAt(targetPosition);
             return;
         }
 
         _glideFrom = _position;
-        _glideTarget = targetUnit;
+        _glideTarget = targetPosition;
         _glideDurationMilliseconds = durationMilliseconds;
         _isGliding = true;
         _glideClock.Restart();
@@ -202,11 +203,11 @@ public sealed partial class CalendarPeriodControl
 
         if (progress >= 1d)
         {
-            var targetUnit = _glideTarget;
+            var targetPosition = _glideTarget;
 
             StopGlide();
-            SetRailPosition(targetUnit);
-            SettleRail(targetUnit);
+            SetRailPosition(targetPosition);
+            SettleAt(targetPosition);
             return;
         }
 
@@ -217,7 +218,7 @@ public sealed partial class CalendarPeriodControl
     /// Moves the rail towards the accumulated wheel target by a share of the remaining distance
     /// that depends on the frame time, so wheel notches run into one continuous movement whose
     /// speed follows the wheel. Once the target is reached the frames stop; the settle timer then
-    /// glides to the nearest snap unit.
+    /// lets the rail come to rest.
     /// </summary>
     private void RenderWheelFrame()
     {
@@ -289,7 +290,19 @@ public sealed partial class CalendarPeriodControl
     }
 
     /// <summary>
-    /// The rail rests on a snap unit. When that is not the period the visible range describes, or
+    /// The rail rests at a free position. The period nearest to the viewport is the one the page
+    /// loads; its load window covers the neighbouring periods the viewport overlaps.
+    /// </summary>
+    private void SettleAt(double position)
+    {
+        if (_space is CalendarRailSpace space)
+        {
+            SettleRail(CalendarRailMotion.ChooseSnapUnit(space, position, 0));
+        }
+    }
+
+    /// <summary>
+    /// The rail rests near a snap unit. When that is not the period the visible range describes, or
     /// an earlier request is still unanswered, the page is asked to load it.
     /// </summary>
     private void SettleRail(int unit)
@@ -376,8 +389,9 @@ public sealed partial class CalendarPeriodControl
     }
 
     /// <summary>
-    /// The wheel went quiet: the rail glides from wherever the smoothing has brought it to the
-    /// snap unit nearest to the wheel target, biased in the wheel's direction.
+    /// The wheel went quiet: the rail glides from wherever the smoothing has brought it to its rest
+    /// position: the wheel target itself in the month view, the nearest day column in the timed
+    /// views, biased in the wheel's direction.
     /// </summary>
     private void WheelSettleTimerTick(DispatcherQueueTimer sender, object args)
     {
@@ -388,7 +402,7 @@ public sealed partial class CalendarPeriodControl
             return;
         }
 
-        var target = CalendarRailMotion.ChooseSnapUnit(space, _isWheelScrolling ? _wheelTargetPosition : _position, _lastWheelDirection);
+        var target = CalendarRailMotion.ChooseRestPosition(space, _isWheelScrolling ? _wheelTargetPosition : _position, _lastWheelDirection);
 
         _isWheelScrolling = false;
         _wheelClock.Stop();

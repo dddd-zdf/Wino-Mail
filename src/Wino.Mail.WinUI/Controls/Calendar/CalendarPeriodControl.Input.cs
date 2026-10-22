@@ -16,7 +16,6 @@ namespace Wino.Calendar.Controls;
 public sealed partial class CalendarPeriodControl
 {
     private const double PanStartThreshold = 6d;
-    private const double FlickVelocityThresholdPixelsPerMillisecond = 0.35d;
     private const double PanVelocitySmoothing = 0.6d;
     private const double ReleaseVelocityTimeoutMilliseconds = 100d;
     private const double MinReleaseGlideMilliseconds = 180d;
@@ -26,7 +25,6 @@ public sealed partial class CalendarPeriodControl
     private Point _panPressPoint;
     private bool _isPanning;
     private double _panStartPosition;
-    private int _panStartUnit;
     private double _panLastAlong;
     private ulong _panLastTimestamp;
     private double _panVelocity;
@@ -64,7 +62,7 @@ public sealed partial class CalendarPeriodControl
                 return;
             }
 
-            if (Math.Abs(along) <= Math.Abs(across) || !TryBeginPan(e.Pointer, space, along, point.Timestamp))
+            if (Math.Abs(along) <= Math.Abs(across) || !TryBeginPan(e.Pointer, along, point.Timestamp))
             {
                 ClearPanState();
                 return;
@@ -101,12 +99,7 @@ public sealed partial class CalendarPeriodControl
         var velocity = idleMilliseconds > ReleaseVelocityTimeoutMilliseconds ? 0d : _panVelocity;
 
         // Dragging towards the start of the rail (left or up) moves to later units.
-        var target = CalendarRailMotion.ChooseReleaseUnit(
-            space,
-            _position,
-            _panStartUnit,
-            -velocity / _unitSize,
-            FlickVelocityThresholdPixelsPerMillisecond / _unitSize);
+        var target = CalendarRailMotion.ChooseReleasePosition(space, _position, -velocity / _unitSize);
 
         CancelPan();
         GlideTo(target, GetReleaseGlideDuration(target, velocity));
@@ -135,7 +128,7 @@ public sealed partial class CalendarPeriodControl
 
         if (wasPanning && _space is CalendarRailSpace space)
         {
-            GlideTo(CalendarRailMotion.ChooseSnapUnit(space, _position, 0), GlideDurationMilliseconds);
+            GlideTo(CalendarRailMotion.ChooseRestPosition(space, _position, 0), GlideDurationMilliseconds);
         }
     }
 
@@ -164,7 +157,7 @@ public sealed partial class CalendarPeriodControl
         Focus(FocusState.Pointer);
     }
 
-    private bool TryBeginPan(Pointer pointer, CalendarRailSpace space, double along, ulong timestamp)
+    private bool TryBeginPan(Pointer pointer, double along, ulong timestamp)
     {
         if (!CapturePointer(pointer))
         {
@@ -177,7 +170,6 @@ public sealed partial class CalendarPeriodControl
 
         _isPanning = true;
         _panStartPosition = _position;
-        _panStartUnit = CalendarRailMotion.ChooseSnapUnit(space, _position, 0);
         _panLastAlong = along;
         _panLastTimestamp = timestamp;
         _panVelocity = 0d;
@@ -247,9 +239,9 @@ public sealed partial class CalendarPeriodControl
     /// A glide whose ease-out starts at the release speed: a cubic ease-out starts at three times
     /// its average speed. Slow releases use the standard duration; both are clamped.
     /// </summary>
-    private double GetReleaseGlideDuration(int targetUnit, double velocityPixelsPerMillisecond)
+    private double GetReleaseGlideDuration(double targetPosition, double velocityPixelsPerMillisecond)
     {
-        var distance = Math.Abs(targetUnit - _position) * _unitSize;
+        var distance = Math.Abs(targetPosition - _position) * _unitSize;
         var speed = Math.Abs(velocityPixelsPerMillisecond);
         var duration = speed > 0.05d ? 3d * distance / speed : GlideDurationMilliseconds;
 

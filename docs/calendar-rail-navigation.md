@@ -2,8 +2,10 @@
 
 The calendar surface pans over an infinite rail instead of switching whole periods. Day, work
 week and week views pan horizontally over day columns; the month view pans vertically over week
-rows. The rail snaps to period boundaries, loads events only once it settles, and keeps a bounded
-window of events in memory. This note describes the shared model so the macOS and iOS surfaces
+rows. Wheel and drag scroll freely, like Apple's Calendar: the month view comes to rest wherever
+the movement ends, and the timed views rest on a whole day column. Arrow buttons, the keyboard and
+external range changes still turn whole periods. The rail loads events only once it settles and
+keeps a bounded window of events in memory. This note describes the shared model so the macOS and iOS surfaces
 behave exactly like the Windows one.
 
 ## Shared model (`Wino.Core.Domain`)
@@ -11,7 +13,7 @@ behave exactly like the Windows one.
 | Type | Role |
 | --- | --- |
 | `CalendarRailSpace` | Maps a display type onto integer **units**: `DateOnly.DayNumber` for Day and Week, work-day indices for WorkWeek, week-row indices for Month. Gives the dates behind a unit, the snap rule per mode, period stepping and the anchor date a snap unit resolves to. |
-| `CalendarRailMotion` | Chooses the unit a moving rail settles on: nearest snap with a direction bias for wheel input, at least one period for a flick, clamped glide starts for long jumps, and the shared ease-out curve. |
+| `CalendarRailMotion` | Chooses where a moving rail rests (`ChooseRestPosition`: any position in the month view, the nearest day column with a direction bias in the timed views; `ChooseReleasePosition` projects a drag's release velocity first), the nearest snap unit for loading and titles, clamped glide starts for long jumps, and the shared ease-out curve. |
 | `CalendarLoadWindow` | The loaded window around a visible range (`PeriodsEachSide` periods on each side) and the parts of a new window that the current one does not cover. |
 
 A **position** is a fractional unit index: `3.4` means the viewport starts 40% into unit 3.
@@ -49,8 +51,10 @@ model produces for the anchor date, so a settled unit and a loaded range always 
 3. Inputs: wheel along the rail axis (Shift+wheel for the horizontal rail with a vertical wheel),
    drag anywhere except on an event, arrow buttons and keyboard by whole periods, Home for today.
    A press becomes a pan after 6 px of dominant movement along the axis.
-4. On settle, raise the anchor date (`GetAnchorDate(unit)`) when it differs from the current
-   `VisibleRange`; the page sends a `LoadCalendarMessage` and the view model answers through
+4. On settle, take the snap unit nearest to the rest position
+   (`CalendarRailMotion.ChooseSnapUnit(space, position, 0)`) and raise its anchor date
+   (`GetAnchorDate(unit)`) when it differs from the current `VisibleRange`. The rail does not move
+   to that unit; the load window around it covers the periods the viewport overlaps; the page sends a `LoadCalendarMessage` and the view model answers through
    `VisibleRange`. An external `VisibleRange` change (today, date picker) glides to its unit.
 5. Dim month cells outside `GetDominantMonth(round(position))`.
 6. While the rail moves, announce the snap unit nearest to the viewport whenever it changes
