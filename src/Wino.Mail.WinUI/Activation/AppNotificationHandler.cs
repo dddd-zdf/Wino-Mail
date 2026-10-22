@@ -134,13 +134,6 @@ internal sealed class AppNotificationHandler
             return true;
         }
 
-        if (toastArguments.TryGetValue(Constants.ToastCopyCodeKey, out string code) &&
-            !string.IsNullOrWhiteSpace(code))
-        {
-            route = new NotificationActivationRoute(NotificationActivationPath.MailCopyCode, false, () => _host.HandleMailToastCopyCodeAsync(code));
-            return true;
-        }
-
         if (toastArguments.TryGetValue(Constants.ToastCalendarActionKey, out string calendarAction) &&
             toastArguments.TryGetValue(Constants.ToastCalendarItemIdKey, out string calendarItemIdString) &&
             Guid.TryParse(calendarItemIdString, out Guid calendarItemId))

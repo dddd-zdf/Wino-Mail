@@ -41,8 +41,7 @@ internal static class ToastActivationResolver
             return calendarAction == Constants.ToastCalendarNavigateAction;
         }
 
-        if (toastArguments.TryGetValue(Constants.ToastDismissActionKey, out string _) ||
-            toastArguments.TryGetValue(Constants.ToastCopyCodeKey, out string _))
+        if (toastArguments.TryGetValue(Constants.ToastDismissActionKey, out string _))
         {
             return false;
         }
@@ -80,7 +79,6 @@ internal static class ToastActivationResolver
         => toastArguments.TryGetValue(Constants.ToastStoreUpdateActionKey, out string _) ||
            toastArguments.TryGetValue(Constants.ToastCalendarActionKey, out string _) ||
            toastArguments.TryGetValue(Constants.ToastDismissActionKey, out string _) ||
-           toastArguments.TryGetValue(Constants.ToastCopyCodeKey, out string _) ||
            toastArguments.TryGetValue(Constants.ToastActionKey, out string _) ||
            toastArguments.TryGetValue(Constants.ToastModeKey, out string _);
 }

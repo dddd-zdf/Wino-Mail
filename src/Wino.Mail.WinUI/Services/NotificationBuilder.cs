@@ -472,9 +472,6 @@ public class NotificationBuilder : INotificationBuilder
         builder.AddArgument(Constants.ToastActionKey, MailOperation.Navigate.ToString());
         builder.AddArgument(Constants.ToastModeKey, Constants.ToastModeMail);
 
-        if (CreateCopyCodeButton(mailItem, settings.Content) is { } copyCodeButton)
-            builder.AddButton(copyCodeButton);
-
         var (firstAction, secondAction) = GetConfiguredMailNotificationActions();
         builder.AddButton(CreateMailNotificationActionButton(firstAction, mailItem.UniqueId));
         builder.AddButton(CreateMailNotificationActionButton(secondAction, mailItem.UniqueId));
@@ -507,27 +504,6 @@ public class NotificationBuilder : INotificationBuilder
         {
             builder.AddText(mailItem.PreviewText);
         }
-    }
-
-    /// <summary>
-    /// Offers to copy a verification code found in the message. Nothing is offered when the account
-    /// hides the subject, and the code stays off the button unless the preview is shown as well.
-    /// </summary>
-    private static AppNotificationButton? CreateCopyCodeButton(MailCopy mailItem, MailNotificationContent content)
-    {
-        if (content is not (MailNotificationContent.SenderSubjectPreview or MailNotificationContent.SenderSubject) ||
-            !VerificationCodeDetector.TryDetect(mailItem.Subject, mailItem.PreviewText, out var code))
-        {
-            return null;
-        }
-
-        var label = content == MailNotificationContent.SenderSubjectPreview
-            ? string.Format(Translator.Notifications_CopyCodeValue, code)
-            : Translator.Notifications_CopyCode;
-
-        return CreateButton(label, "copy")
-            .AddArgument(Constants.ToastCopyCodeKey, code)
-            .AddArgument(Constants.ToastModeKey, Constants.ToastModeMail);
     }
 
     private bool ShouldCreateMailNotification(MailCopy mailItem, IReadOnlyCollection<MailAccount> accounts)

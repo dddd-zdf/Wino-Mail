@@ -1439,31 +1439,6 @@ public partial class App : WinoApplication,
         await storeService.StartUpdateAsync();
     }
 
-    /// <summary>
-    /// Copies the verification code from a mail notification. The clipboard is flushed so the code
-    /// stays available after a transient activation process exits.
-    /// </summary>
-    private Task HandleToastCopyCodeAsync(string code)
-        => ExecuteOnActivationUiThreadAsync(() =>
-        {
-            try
-            {
-                var package = new DataPackage();
-                package.SetText(code);
-
-                Clipboard.SetContent(package);
-                Clipboard.Flush();
-
-                LogActivation("Copied verification code from notification.");
-            }
-            catch (Exception ex)
-            {
-                Log.Error(ex, "Failed to copy verification code from notification.");
-            }
-
-            return Task.CompletedTask;
-        });
-
     private async Task HandleCalendarToastNavigationAsync(Guid calendarItemId)
     {
         var calendarService = Services.GetRequiredService<ICalendarService>();

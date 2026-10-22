@@ -39,7 +39,6 @@ internal enum NotificationActivationPath
     MailNavigation,
     MailCompose,
     MailBackgroundAction,
-    MailCopyCode,
     ModeNavigation,
     Unknown
 }
@@ -120,7 +119,6 @@ internal static class ActivationPathNames
             NotificationActivationPath.MailNavigation => "mail notification navigation",
             NotificationActivationPath.MailCompose => "mail notification compose",
             NotificationActivationPath.MailBackgroundAction => "mail notification background action",
-            NotificationActivationPath.MailCopyCode => "mail notification copy code",
             NotificationActivationPath.ModeNavigation => "notification mode navigation",
             NotificationActivationPath.Unknown => "unknown notification",
             _ => path.ToString()
