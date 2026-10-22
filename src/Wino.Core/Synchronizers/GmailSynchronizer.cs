@@ -41,6 +41,7 @@ using Wino.Core.Extensions;
 using Wino.Core.Google;
 using Wino.Core.Helpers;
 using Wino.Core.Http;
+using Wino.Core.Integration;
 using Wino.Core.Integration.Processors;
 using Wino.Core.Misc;
 using Wino.Core.Requests.Bundles;
@@ -52,6 +53,7 @@ using Wino.Core.Requests.Mail;
 using Wino.Core.Requests.Tasks;
 using Wino.Mail.AI.Abstractions;
 using MailBodyLocator = Wino.Core.Domain.Models.Intelligence.MailBodyLocator;
+using Wino.Messaging.Server;
 using Wino.Messaging.UI;
 using Wino.Services;
 using DriveFile = global::Google.Apis.Drive.v3.Data.File;
@@ -90,7 +92,7 @@ public partial class GmailSynchronizerJsonContext : JsonSerializerContext;
 /// - CreateMinimalMailCopyAsync: Extracts MailCopy fields from Gmail Metadata format
 /// - DownloadMissingMimeMessageAsync: Downloads raw MIME only when explicitly requested
 /// </summary>
-public partial class GmailSynchronizer : WinoSynchronizer<IGoogleApiRequest, Message, Event, global::Google.Apis.PeopleService.v1.Data.Person>, IProviderMailFilterSynchronizer, ISemanticMailBodySynchronizer
+public partial class GmailSynchronizer : WinoSynchronizer<IGoogleApiRequest, Message, Event, global::Google.Apis.PeopleService.v1.Data.Person>, IProviderMailFilterSynchronizer, ISemanticMailBodySynchronizer, IMailChangeWatcherSynchronizer
 {
     public override uint BatchModificationSize => 1000;
 
@@ -123,6 +125,7 @@ public partial class GmailSynchronizer : WinoSynchronizer<IGoogleApiRequest, Mes
     private readonly IGmailChangeProcessor _gmailChangeProcessor;
     private readonly IGmailSynchronizerErrorHandlerFactory _gmailSynchronizerErrorHandlerFactory;
     private readonly IMailFilterExecutor _mailFilterExecutor;
+    private readonly GmailImapChangeWatcher _changeWatcher;
     private readonly ILogger _logger = Log.ForContext<GmailSynchronizer>();
 
     // Keeping a reference for quick access to the virtual archive folder.
@@ -150,6 +153,7 @@ public partial class GmailSynchronizer : WinoSynchronizer<IGoogleApiRequest, Mes
             taskService,
             cardDavSynchronizationEngine)
     {
+        _changeWatcher = new GmailImapChangeWatcher(account, authenticator, RequestChangeWatcherSynchronization);
     }
 
     internal GmailSynchronizer(
@@ -4620,9 +4624,26 @@ public partial class GmailSynchronizer : WinoSynchronizer<IGoogleApiRequest, Mes
 
     #endregion
 
+    public Task StartChangeWatcherAsync()
+        => _changeWatcher == null || IsDisposing ? Task.CompletedTask : _changeWatcher.StartAsync();
+
+    public Task StopChangeWatcherAsync()
+        => _changeWatcher?.StopAsync() ?? Task.CompletedTask;
+
+    // The History API delta covers every label, so the IDLE signal runs the regular mail synchronization.
+    private void RequestChangeWatcherSynchronization()
+        => WeakReferenceMessenger.Default.Send(new NewMailSynchronizationRequested(new MailSynchronizationOptions
+        {
+            AccountId = Account.Id,
+            Type = MailSynchronizationType.IMAPIdle
+        }));
+
+    protected override void OnIdleSynchronizationDeferred() => _changeWatcher?.RequestSynchronization();
+
     public override async Task KillSynchronizerAsync()
     {
         await base.KillSynchronizerAsync();
+        await StopChangeWatcherAsync().ConfigureAwait(false);
 
         _gmailService.Dispose();
         if (!ReferenceEquals(_gmailFilterService, _gmailService))
