@@ -25,6 +25,8 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-dotnet@v4
         with:
@@ -37,9 +39,14 @@ jobs:
       - name: Restore tools
         run: dotnet tool restore
 
+      # Like the local -Changed check: only XAML this branch changed, compared with main.
       - name: Check XAML formatting
         shell: pwsh
-        run: ./scripts/maintenance/windows/format-xaml.ps1 -Check
+        run: |
+          $base = git merge-base HEAD origin/main
+          $files = @(git diff --name-only --diff-filter=ACMR $base HEAD -- '*.xaml')
+          if ($files.Count -eq 0) { "No changed XAML files."; exit 0 }
+          ./scripts/maintenance/windows/format-xaml.ps1 -Check -Path $files
 
       - name: Build Debug x64
         run: dotnet build src/Wino.Mail.WinUI/Wino.Mail.WinUI.csproj -c Debug -p:Platform=x64 -p:RuntimeIdentifier=win-x64
