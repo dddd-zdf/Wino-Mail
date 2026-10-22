@@ -18,11 +18,12 @@ using Wino.Core.Domain.Models.Authentication;
 
 namespace Wino.Authentication;
 
-public class OutlookAuthenticator : BaseAuthenticator, IOutlookAuthenticator, ISubstrateTaskTokenProvider
+public class OutlookAuthenticator : BaseAuthenticator, IOutlookAuthenticator, ISubstrateTaskTokenProvider, IOutlookImapTokenProvider
 {
     // Exchange Online, not Graph. MSAL issues one token per resource, so this can never be
     // folded into GetScope and has to be acquired on its own.
     private static readonly string[] SubstrateTaskScopes = ["https://outlook.office.com/Tasks.ReadWrite"];
+    private static readonly string[] ImapScopes = ["https://outlook.office.com/IMAP.AccessAsUser.All"];
     private static readonly HttpClient GraphProfileHttpClient = new();
 
     // Reuse an access token until shortly before it expires.
@@ -198,6 +199,71 @@ public class OutlookAuthenticator : BaseAuthenticator, IOutlookAuthenticator, IS
 
         await _host.AcquireTokenInteractiveAsync(SubstrateTaskScopes, storedAccount,
             GetAuthenticationAddress(account), cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Best-effort IMAP token for the instant new mail watcher. Returns null whenever the account
+    /// has not consented to IMAP, so the watcher stays off instead of flagging the account.
+    /// Deliberately never throws <see cref="AuthenticationAttentionException"/>.
+    /// </summary>
+    public async Task<string> GetImapTokenAsync(MailAccount account, bool forceRefresh = false, CancellationToken cancellationToken = default)
+    {
+        if (account is null)
+            return null;
+
+        try
+        {
+            await _host.EnsureTokenCacheAttachedAsync(cancellationToken).ConfigureAwait(false);
+
+            var cachedAccounts = (await _publicClientApplication.GetAccountsAsync().WaitAsync(cancellationToken).ConfigureAwait(false)).ToList();
+            var storedAccount = FindStoredAccount(cachedAccounts, account);
+
+            if (storedAccount is null)
+                return null;
+
+            var authResult = await _publicClientApplication
+                .AcquireTokenSilent(ImapScopes, storedAccount)
+                .WithForceRefresh(forceRefresh)
+                .ExecuteAsync(cancellationToken)
+                .ConfigureAwait(false);
+
+            return authResult.AccessToken;
+        }
+        catch (MsalException ex)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            Logger.Debug("Outlook IMAP token is unavailable. ErrorCode: {ErrorCode}, Classification: {Classification}",
+                ex.ErrorCode, (ex as MsalUiRequiredException)?.Classification);
+
+            return null;
+        }
+    }
+
+    public async Task EnsureImapConsentAsync(MailAccount account, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(account);
+
+        await _host.EnsureTokenCacheAttachedAsync(cancellationToken).ConfigureAwait(false);
+        var cachedAccounts = (await _publicClientApplication.GetAccountsAsync().WaitAsync(cancellationToken).ConfigureAwait(false)).ToList();
+        var storedAccount = FindStoredAccount(cachedAccounts, account);
+
+        // An earlier consent is reused without showing the prompt again.
+        if (await GetImapTokenAsync(account, cancellationToken: cancellationToken).ConfigureAwait(false) != null)
+            return;
+
+        if (!_host.CanAuthenticateInteractively)
+            throw new AuthenticationAttentionException(account);
+
+        try
+        {
+            await _host.AcquireTokenInteractiveAsync(ImapScopes, storedAccount,
+                GetAuthenticationAddress(account), cancellationToken).ConfigureAwait(false);
+        }
+        catch (MsalClientException ex) when (ex.ErrorCode is "authentication_canceled" or "access_denied")
+        {
+            throw new AccountSetupCanceledException();
+        }
     }
 
     public async Task DeleteTokenInformationAsync(MailAccount account, CancellationToken cancellationToken = default)

@@ -5,6 +5,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Wino.Core.Domain.Entities.Shared;
 using Wino.Core.Domain.Enums;
+using Wino.Core.Domain.Exceptions;
 using Wino.Core.Domain.Interfaces;
 using Wino.Core.Domain.Models.Synchronization;
 
@@ -44,6 +45,46 @@ public sealed class AccountCapabilityService : IAccountCapabilityService
 
         if (account.IsContactAccessEnabled && account.ContactIntegrationSource == AccountIntegrationSource.Local)
             await _contactService.EnsureLocalAddressBookAsync(account.Id, account.Name).ConfigureAwait(false);
+    }
+
+    public async Task<bool> SetInstantMailEnabledAsync(MailAccount account, bool isEnabled, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(account);
+        if (account.ProviderType is not (MailProviderType.Outlook or MailProviderType.Gmail))
+            throw new NotSupportedException("Instant new mail is a setting of Outlook and Gmail accounts.");
+
+        // Gmail checks with its existing mail token, so only Outlook needs a consent.
+        if (isEnabled && account.ProviderType == MailProviderType.Outlook)
+        {
+            if (_authenticationProvider?.GetAuthenticator(account.ProviderType) is not IOutlookImapTokenProvider imapTokenProvider)
+                return false;
+
+            try
+            {
+                await imapTokenProvider.EnsureImapConsentAsync(account, cancellationToken).ConfigureAwait(false);
+            }
+            catch (AccountSetupCanceledException)
+            {
+                return false;
+            }
+        }
+
+        account.Preferences.IsInstantMailEnabled = isEnabled;
+        await _accountService.UpdateAccountAsync(account).ConfigureAwait(false);
+
+        var synchronizer = await _synchronizationManager.GetSynchronizerAsync(account.Id).ConfigureAwait(false);
+        if (synchronizer?.Account?.Preferences is { } synchronizerPreferences)
+            synchronizerPreferences.IsInstantMailEnabled = isEnabled;
+
+        // Restarting applies the setting: each synchronizer starts what the preference allows. Gmail
+        // keeps its IDLE watcher either way and adds or drops the fast checks.
+        if (synchronizer is IMailChangeWatcherSynchronizer changeWatcherSynchronizer)
+        {
+            await changeWatcherSynchronizer.StopChangeWatcherAsync().ConfigureAwait(false);
+            await changeWatcherSynchronizer.StartChangeWatcherAsync().ConfigureAwait(false);
+        }
+
+        return true;
     }
 
     public async Task<MailAccount> ApplyAsync(

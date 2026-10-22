@@ -42,6 +42,7 @@ using Wino.Core.Domain.Models.Tasks;
 using Wino.Core.Extensions;
 using Wino.Core.Http;
 using Wino.Core.Helpers;
+using Wino.Core.Integration;
 using Wino.Core.Integration.Processors;
 using Wino.Core.Misc;
 using Wino.Core.Outlook;
@@ -53,6 +54,7 @@ using Wino.Core.Requests.Category;
 using Wino.Core.Requests.Folder;
 using Wino.Core.Requests.Mail;
 using Wino.Core.Requests.Tasks;
+using Wino.Messaging.Server;
 using Wino.Messaging.UI;
 using Wino.Mail.AI.Abstractions;
 using MailBodyLocator = Wino.Core.Domain.Models.Intelligence.MailBodyLocator;
@@ -82,7 +84,7 @@ public partial class OutlookSynchronizerJsonContext : JsonSerializerContext;
 /// - CreateMailCopyFromMessageAsync: Creates MailCopy from Message metadata
 /// - DownloadMissingMimeMessageAsync: Downloads raw MIME only when explicitly requested
 /// </summary>
-public partial class OutlookSynchronizer : WinoSynchronizer<RequestInformation, Message, Event, Contact>, IProviderMailFilterSynchronizer, ISemanticMailBodyBatchSynchronizer
+public partial class OutlookSynchronizer : WinoSynchronizer<RequestInformation, Message, Event, Contact>, IProviderMailFilterSynchronizer, ISemanticMailBodyBatchSynchronizer, IMailChangeWatcherSynchronizer
 {
     private const string WinoTaskExtensionName = "com.winomail.taskIdentity";
     private const string WinoTaskLocalIdProperty = "localTaskId";
@@ -166,6 +168,7 @@ public partial class OutlookSynchronizer : WinoSynchronizer<RequestInformation, 
     private static readonly HttpClient SubstrateHttpClient = new() { Timeout = TimeSpan.FromSeconds(30) };
     private readonly ISubstrateTaskTokenProvider _substrateTokenProvider;
     private readonly OutlookSubstrateTasksClient _outlookSubstrateTasksClient;
+    private readonly ImapMailboxChangeWatcher _changeWatcher;
 
     private static string FormatGraphDate(DateTime value)
         => value.ToString("yyyy'-'MM'-'dd", GlobalizationCultureInfo.InvariantCulture);
@@ -209,7 +212,39 @@ public partial class OutlookSynchronizer : WinoSynchronizer<RequestInformation, 
             SubstrateHttpClient,
             () => _substrateTokenProvider is null ? Task.FromResult<string>(null) : _substrateTokenProvider.GetSubstrateTaskTokenAsync(Account));
         _cardDavSynchronizationEngine = cardDavSynchronizationEngine;
+
+        // Exchange Online IMAP signs in with the Microsoft account name, which can differ from the
+        // mailbox address for accounts that sign in with an alias.
+        if (authenticator is IOutlookImapTokenProvider imapTokenProvider)
+        {
+            _changeWatcher = new ImapMailboxChangeWatcher(
+                account,
+                new ImapChangeWatcherConnection(
+                    "Outlook",
+                    "outlook.office365.com",
+                    () => string.IsNullOrWhiteSpace(Account.AuthenticationAddress) ? Account.Address : Account.AuthenticationAddress,
+                    (forceRefresh, cancellationToken) => imapTokenProvider.GetImapTokenAsync(Account, forceRefresh, cancellationToken)),
+                RequestChangeWatcherSynchronization);
+        }
     }
+
+    public Task StartChangeWatcherAsync()
+        => _changeWatcher == null || IsDisposing || Account.Preferences?.IsInstantMailEnabled != true
+            ? Task.CompletedTask
+            : _changeWatcher.StartAsync();
+
+    public Task StopChangeWatcherAsync()
+        => _changeWatcher?.StopAsync() ?? Task.CompletedTask;
+
+    // An IDLE-triggered synchronization covers only the Inbox delta.
+    private void RequestChangeWatcherSynchronization()
+        => WeakReferenceMessenger.Default.Send(new NewMailSynchronizationRequested(new MailSynchronizationOptions
+        {
+            AccountId = Account.Id,
+            Type = MailSynchronizationType.IMAPIdle
+        }));
+
+    protected override void OnIdleSynchronizationDeferred() => _changeWatcher?.RequestSynchronization();
 
     protected override Task ExecuteContactRequestsInternalAsync(IReadOnlyList<IContactActionRequest> requests, CancellationToken cancellationToken = default)
         => Account.ContactIntegrationSource switch
@@ -1872,6 +1907,11 @@ public partial class OutlookSynchronizer : WinoSynchronizer<RequestInformation, 
             : await _mailFilterExecutor.ProcessNewMessagesAsync(Account.Id, filterCandidateIds, cancellationToken).ConfigureAwait(false);
         var unreadNewItems = await _outlookChangeProcessor.GetDownloadedUnreadMailsAsync(Account.Id, downloadedMessageIds).ConfigureAwait(false);
         unreadNewItems.RemoveAll(item => suppressedIds.Contains(item.Id));
+
+        // CreationDate is the time Exchange received the message, so this is the delay to the app.
+        foreach (var item in unreadNewItems)
+            _logger.Information("New Outlook message for {Name} arrived {DelaySeconds:F1}s after Outlook received it ({SynchronizationType}).",
+                Account.Name, (DateTime.UtcNow - item.CreationDate).TotalSeconds, options.Type);
 
         return MailSynchronizationResult.CompletedWithFolderResults(unreadNewItems, folderResults);
     }
@@ -5797,6 +5837,7 @@ public partial class OutlookSynchronizer : WinoSynchronizer<RequestInformation, 
     public override async Task KillSynchronizerAsync()
     {
         await base.KillSynchronizerAsync();
+        await StopChangeWatcherAsync().ConfigureAwait(false);
 
         _graphClient.Dispose();
     }

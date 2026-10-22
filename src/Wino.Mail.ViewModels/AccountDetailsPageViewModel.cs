@@ -129,6 +129,15 @@ public partial class AccountDetailsPageViewModel : MailBaseViewModel, IRecipient
     public partial bool IsNotificationContentHidden { get; set; }
 
     [ObservableProperty]
+    public partial bool IsInstantMailEnabled { get; set; }
+
+    [ObservableProperty]
+    public partial bool IsApplyingInstantMail { get; set; }
+
+    // Set while a canceled or failed change puts the toggle back, so that is not saved again.
+    private bool _isRevertingInstantMail;
+
+    [ObservableProperty]
     public partial bool IsProtocolLogEnabled { get; set; }
 
     [ObservableProperty]
@@ -159,6 +168,13 @@ public partial class AccountDetailsPageViewModel : MailBaseViewModel, IRecipient
     public partial bool IsApplyingCapabilities { get; set; }
 
     public bool IsFocusedInboxSupportedForAccount => Account != null && Account.Preferences.IsFocusedInboxEnabled != null;
+
+    public bool IsInstantMailSupportedForAccount => Account?.ProviderType is MailProviderType.Outlook or MailProviderType.Gmail;
+
+    // Outlook listens over IMAP after a consent; Gmail checks every few seconds instead.
+    public string InstantMailDescription => Account?.ProviderType == MailProviderType.Gmail
+        ? Translator.SettingsInstantMail_GmailDescription
+        : Translator.SettingsInstantMail_OutlookDescription;
     public bool IsImapServer => ServerInformation != null;
     public bool HasMailAccess => Account?.IsMailAccessGranted == true;
     public bool HasCalendarAccess => Account?.IsCalendarAccessGranted == true;
@@ -912,6 +928,7 @@ public partial class AccountDetailsPageViewModel : MailBaseViewModel, IRecipient
             IsAppendMessageSettinEnabled = Account.Preferences.ShouldAppendMessagesToSentFolder;
             IsJumpListEnabled = Account.Preferences.IsJumpListEnabled;
             IsNotificationContentHidden = Account.Preferences.HideNotificationContent;
+            IsInstantMailEnabled = Account.Preferences.IsInstantMailEnabled;
             IsProtocolLogEnabled = Account.IsProtocolLogEnabled;
 
             if (!string.IsNullOrEmpty(Account.AccountColorHex))
@@ -1078,6 +1095,8 @@ public partial class AccountDetailsPageViewModel : MailBaseViewModel, IRecipient
         SelectedCapabilityOption = value is null ? null! :
             ResolveCapabilityOption(value.IsMailAccessGranted, value.IsCalendarAccessGranted);
         OnPropertyChanged(nameof(IsFocusedInboxSupportedForAccount));
+        OnPropertyChanged(nameof(IsInstantMailSupportedForAccount));
+        OnPropertyChanged(nameof(InstantMailDescription));
         OnPropertyChanged(nameof(ProviderIconPath));
         OnPropertyChanged(nameof(Address));
         OnPropertyChanged(nameof(IsInitialSynchronizationSummaryVisible));
@@ -1108,8 +1127,10 @@ public partial class AccountDetailsPageViewModel : MailBaseViewModel, IRecipient
         base.OnPropertyChanged(e);
 
         if (!isLoaded || Account is null) return;
+        if (e.PropertyName == nameof(IsInstantMailEnabled) && _isRevertingInstantMail) return;
         if (e.PropertyName is not (nameof(IsFocusedInboxEnabled) or nameof(IsAppendMessageSettinEnabled) or
             nameof(IsSignatureEnabled) or nameof(IsJumpListEnabled) or nameof(IsNotificationContentHidden) or
+            nameof(IsInstantMailEnabled) or
             nameof(SelectedPrimaryCalendar))) return;
 
         var write = PersistPreferenceChangeAsync(e.PropertyName, Account);
@@ -1144,6 +1165,9 @@ public partial class AccountDetailsPageViewModel : MailBaseViewModel, IRecipient
                 account.Preferences.HideNotificationContent = IsNotificationContentHidden;
                 await _accountService.UpdateAccountAsync(account);
                 break;
+            case nameof(IsInstantMailEnabled) when IsInstantMailSupportedForAccount:
+                await ApplyInstantMailAsync(account, IsInstantMailEnabled);
+                break;
             case nameof(SelectedPrimaryCalendar) when SelectedPrimaryCalendar != null:
                 foreach (var calendar in AccountCalendars)
                 {
@@ -1157,6 +1181,29 @@ public partial class AccountDetailsPageViewModel : MailBaseViewModel, IRecipient
         catch (Exception)
         {
             _dialogService.InfoBarMessage(Translator.GeneralTitle_Error, Translator.MacOSMail_OperationFailed, InfoBarMessageType.Error);
+        }
+    }
+
+    private async Task ApplyInstantMailAsync(MailAccount account, bool isEnabled)
+    {
+        IsApplyingInstantMail = true;
+        var isApplied = false;
+
+        try
+        {
+            // For Outlook, turning it on shows Microsoft's IMAP consent prompt the first time.
+            isApplied = await _accountCapabilityService.SetInstantMailEnabledAsync(account, isEnabled);
+        }
+        finally
+        {
+            if (!isApplied)
+            {
+                _isRevertingInstantMail = true;
+                IsInstantMailEnabled = account.Preferences.IsInstantMailEnabled;
+                _isRevertingInstantMail = false;
+            }
+
+            IsApplyingInstantMail = false;
         }
     }
 
