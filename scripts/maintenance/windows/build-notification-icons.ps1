@@ -47,6 +47,7 @@ $SvgIcons = [ordered]@{
     'open'          = 'Open'
     'account-fix'   = 'Wrench'
     'calendar-join' = 'EventJoinOnline'
+    'copy'          = 'Copy'
 }
 
 $Scales = [ordered]@{ 100 = 16; 125 = 20; 150 = 24; 200 = 32; 400 = 64 }

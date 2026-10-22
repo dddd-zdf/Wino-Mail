@@ -36,6 +36,7 @@ public static class Constants
     public const string ToastModePeople = nameof(ToastModePeople);
     public const string ToastModeTasks = nameof(ToastModeTasks);
     public const string ToastDismissActionKey = nameof(ToastDismissActionKey);
+    public const string ToastCopyCodeKey = nameof(ToastCopyCodeKey);
     public const string ToastStoreUpdateActionKey = nameof(ToastStoreUpdateActionKey);
     public const string ToastStoreUpdateActionInstall = nameof(ToastStoreUpdateActionInstall);
     public const string StoreUpdateNotificationSuppressionKey = nameof(StoreUpdateNotificationSuppressionKey);
