@@ -88,6 +88,14 @@ public partial class MailAccountPreferences
     public bool? IsFocusedInboxEnabled { get; set; }
 
     /// <summary>
+    /// Gets or sets whether new mail is synchronized as soon as it arrives. An Outlook account keeps
+    /// an IMAP IDLE connection open, which asks once for IMAP consent. A Gmail account always keeps
+    /// its IDLE connection, but Gmail delays those notifications, so this setting adds a mailbox
+    /// check every few seconds.
+    /// </summary>
+    public bool IsInstantMailEnabled { get; set; }
+
+    /// <summary>
     /// Gets or sets whether signature should be appended automatically.
     /// </summary>
     public bool IsSignatureEnabled { get; set; }

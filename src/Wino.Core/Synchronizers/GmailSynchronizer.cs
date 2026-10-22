@@ -125,7 +125,7 @@ public partial class GmailSynchronizer : WinoSynchronizer<IGoogleApiRequest, Mes
     private readonly IGmailChangeProcessor _gmailChangeProcessor;
     private readonly IGmailSynchronizerErrorHandlerFactory _gmailSynchronizerErrorHandlerFactory;
     private readonly IMailFilterExecutor _mailFilterExecutor;
-    private readonly GmailImapChangeWatcher _changeWatcher;
+    private readonly ImapMailboxChangeWatcher _changeWatcher;
     private readonly ILogger _logger = Log.ForContext<GmailSynchronizer>();
 
     // Keeping a reference for quick access to the virtual archive folder.
@@ -153,7 +153,17 @@ public partial class GmailSynchronizer : WinoSynchronizer<IGoogleApiRequest, Mes
             taskService,
             cardDavSynchronizationEngine)
     {
-        _changeWatcher = new GmailImapChangeWatcher(account, authenticator, RequestChangeWatcherSynchronization);
+        // The mail token carries https://mail.google.com/, which Gmail IMAP accepts.
+        _changeWatcher = new ImapMailboxChangeWatcher(
+            account,
+            new ImapChangeWatcherConnection(
+                "Gmail",
+                "imap.gmail.com",
+                () => Account.Address,
+                async (forceRefresh, cancellationToken) => (forceRefresh
+                    ? await authenticator.RefreshTokenInformationAsync(account, cancellationToken: cancellationToken).ConfigureAwait(false)
+                    : await authenticator.GetTokenInformationAsync(account, cancellationToken: cancellationToken).ConfigureAwait(false)).AccessToken),
+            RequestChangeWatcherSynchronization);
     }
 
     internal GmailSynchronizer(
@@ -1372,6 +1382,9 @@ public partial class GmailSynchronizer : WinoSynchronizer<IGoogleApiRequest, Mes
                 else
                 {
                     shouldRunLocalFilters = true;
+
+                    if (options.Type == MailSynchronizationType.IMAPIdle && deltaResult.HistoryRecordCount == 0)
+                        _changeWatcher?.RequestFollowUp();
                 }
 
                 UpdateSyncProgress(0, 0, "Changes synchronized");
@@ -1418,13 +1431,18 @@ public partial class GmailSynchronizer : WinoSynchronizer<IGoogleApiRequest, Mes
         var unreadNewItems = await _gmailChangeProcessor.GetDownloadedUnreadMailsAsync(Account.Id, downloadedMessageIds).ConfigureAwait(false);
         unreadNewItems.RemoveAll(item => suppressedIds.Contains(item.Id));
 
+        // CreationDate is Gmail's receive time, so this is the delay from arrival to the app.
+        foreach (var item in unreadNewItems)
+            _logger.Information("New Gmail message for {Name} arrived {DelaySeconds:F1}s after Gmail received it ({SynchronizationType}).",
+                Account.Name, (DateTime.UtcNow - item.CreationDate).TotalSeconds, options.Type);
+
         return MailSynchronizationResult.CompletedWithFolderResults(unreadNewItems, folderResults);
     }
 
     /// <summary>
     /// Result of delta synchronization using History API.
     /// </summary>
-    private record DeltaSyncResult(List<string> DownloadedMessageIds, bool RequiresFullResync);
+    private record DeltaSyncResult(List<string> DownloadedMessageIds, bool RequiresFullResync, int HistoryRecordCount = 0);
 
     private async Task<List<string>> PerformInitialSyncWithHistoryAsync(MailSynchronizationOptions options, CancellationToken cancellationToken)
     {
@@ -1705,7 +1723,7 @@ public partial class GmailSynchronizer : WinoSynchronizer<IGoogleApiRequest, Mes
                 Account.Name, startHistoryId, Account.SynchronizationDeltaIdentifier, historyRecordCount);
             _logger.Information("Delta sync completed. Downloaded {Count} new messages for {Name}", downloadedMessageIds.Count, Account.Name);
 
-            return new DeltaSyncResult(downloadedMessageIds, RequiresFullResync: false);
+            return new DeltaSyncResult(downloadedMessageIds, RequiresFullResync: false, historyRecordCount);
         }
         catch (GoogleApiException ex) when (ex.HttpStatusCode == System.Net.HttpStatusCode.TooManyRequests)
         {
@@ -4624,11 +4642,110 @@ public partial class GmailSynchronizer : WinoSynchronizer<IGoogleApiRequest, Mes
 
     #endregion
 
-    public Task StartChangeWatcherAsync()
-        => _changeWatcher == null || IsDisposing ? Task.CompletedTask : _changeWatcher.StartAsync();
+    // Gmail holds IMAP IDLE notifications back for about 30 seconds. With instant new mail on, the
+    // mailbox history id is checked on this interval instead; it costs one quota unit per check.
+    private static readonly TimeSpan InstantMailCheckInterval = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan InstantMailErrorDelay = TimeSpan.FromSeconds(30);
 
-    public Task StopChangeWatcherAsync()
-        => _changeWatcher?.StopAsync() ?? Task.CompletedTask;
+    private readonly SemaphoreSlim _instantMailLifecycle = new(1, 1);
+    private CancellationTokenSource _instantMailCancellationTokenSource;
+    private Task _instantMailTask;
+
+    public async Task StartChangeWatcherAsync()
+    {
+        if (_changeWatcher == null || IsDisposing) return;
+
+        await _changeWatcher.StartAsync().ConfigureAwait(false);
+
+        if (Account.Preferences?.IsInstantMailEnabled != true) return;
+
+        await _instantMailLifecycle.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            if (IsDisposing || _instantMailTask is { IsCompleted: false }) return;
+            _instantMailCancellationTokenSource?.Dispose();
+            _instantMailCancellationTokenSource = new CancellationTokenSource();
+            var token = _instantMailCancellationTokenSource.Token;
+            _instantMailTask = Task.Run(() => RunInstantMailChecksAsync(token));
+        }
+        finally { _instantMailLifecycle.Release(); }
+    }
+
+    public async Task StopChangeWatcherAsync()
+    {
+        await _instantMailLifecycle.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            _instantMailCancellationTokenSource?.Cancel();
+            try
+            {
+                if (_instantMailTask != null) await _instantMailTask.ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) { }
+            _instantMailCancellationTokenSource?.Dispose();
+            _instantMailCancellationTokenSource = null;
+            _instantMailTask = null;
+        }
+        finally { _instantMailLifecycle.Release(); }
+
+        if (_changeWatcher != null) await _changeWatcher.StopAsync().ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Compares Gmail's current history id with the stored one and asks for a synchronization
+    /// only when the mailbox changed. The request goes through the IDLE watcher so both signals
+    /// share its spacing and the deferral handling of a pending synchronization.
+    /// </summary>
+    private async Task RunInstantMailChecksAsync(CancellationToken cancellationToken)
+    {
+        _logger.Debug("Started instant new mail checks for {Name} every {Interval}.", Account.Name, InstantMailCheckInterval);
+
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            var delay = InstantMailCheckInterval;
+
+            try
+            {
+                // No stored cursor yet means the initial synchronization has not finished.
+                if (ulong.TryParse(Account.SynchronizationDeltaIdentifier, NumberStyles.None, CultureInfo.InvariantCulture, out var storedHistoryId))
+                {
+                    var profile = await _gmailService.Users.GetProfile("me").ExecuteAsync(cancellationToken).ConfigureAwait(false);
+
+                    if (profile.HistoryId is { } currentHistoryId && currentHistoryId > storedHistoryId)
+                    {
+                        _logger.Debug("Instant new mail check found history {CurrentHistoryId} after {StoredHistoryId} for {Name}.",
+                            currentHistoryId, storedHistoryId, Account.Name);
+                        _changeWatcher.RequestSynchronization();
+                    }
+                }
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (Exception ex) when (ex is AuthenticationAttentionException or AccountAttentionRequiredException)
+            {
+                // The regular synchronization reports sign-in problems; SynchronizerFactory restarts
+                // the checks once the account no longer needs attention.
+                _logger.Information("Stopped instant new mail checks for {Name}: the account needs attention.", Account.Name);
+                return;
+            }
+            catch (Exception ex)
+            {
+                _logger.Debug(ex, "Instant new mail check failed for {Name}. Retrying in {Delay}.", Account.Name, InstantMailErrorDelay);
+                delay = InstantMailErrorDelay;
+            }
+
+            try
+            {
+                await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+        }
+    }
 
     // The History API delta covers every label, so the IDLE signal runs the regular mail synchronization.
     private void RequestChangeWatcherSynchronization()

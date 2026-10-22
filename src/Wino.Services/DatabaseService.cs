@@ -721,6 +721,13 @@ WHERE ImapUid > 0 AND COALESCE(ImapUidValidity, 0) = 0
                 .ConfigureAwait(false);
         }
 
+        if (!accountPreferencesColumns.Any(c => c.Name == nameof(MailAccountPreferences.IsInstantMailEnabled)))
+        {
+            await Connection
+                .ExecuteAsync($"ALTER TABLE {nameof(MailAccountPreferences)} ADD COLUMN {nameof(MailAccountPreferences.IsInstantMailEnabled)} INTEGER NOT NULL DEFAULT 0")
+                .ConfigureAwait(false);
+        }
+
         if (!accountPreferencesColumns.Any(c => c.Name == nameof(MailAccountPreferences.IsDailyBriefingEnabled)))
         {
             await Connection

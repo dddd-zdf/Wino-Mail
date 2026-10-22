@@ -19,4 +19,11 @@ public interface IAccountCapabilityService
     /// contacts need. Existing stores are kept, so calling it again changes nothing.
     /// </summary>
     Task EnsureLocalCapabilityStoresAsync(MailAccount account, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Turns instant new mail on or off for an Outlook or Gmail account. For Outlook, turning it on
+    /// asks once for IMAP consent; returns false when the user cancels it, and the setting stays off.
+    /// For Gmail it checks the mailbox every few seconds with the existing sign-in.
+    /// </summary>
+    Task<bool> SetInstantMailEnabledAsync(MailAccount account, bool isEnabled, CancellationToken cancellationToken = default);
 }

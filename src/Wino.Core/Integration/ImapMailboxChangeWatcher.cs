@@ -9,34 +9,48 @@ using Serilog;
 using Wino.Core.Domain.Entities.Shared;
 using Wino.Core.Domain.Exceptions;
 using Wino.Core.Domain.Extensions;
-using Wino.Core.Domain.Interfaces;
 
 namespace Wino.Core.Integration;
 
 /// <summary>
-/// Holds one IMAP IDLE connection to Gmail as a change signal. It downloads nothing: every change it
-/// hears about asks the synchronizer for a History API delta sync, which stays the only data path.
-/// The scheduled synchronization remains the fallback when IMAP is unavailable for the account.
+/// How an API account's mailbox is reached over IMAP. The token is an OAuth access token for
+/// XOAUTH2; a null token means the account has not granted IMAP access, and the watcher stays off.
 /// </summary>
-internal sealed class GmailImapChangeWatcher
+internal sealed record ImapChangeWatcherConnection(
+    string ProviderName,
+    string Host,
+    Func<string> GetUserName,
+    Func<bool, CancellationToken, Task<string>> GetAccessTokenAsync);
+
+/// <summary>
+/// Holds one IMAP IDLE connection to the Inbox of an API account (Gmail, Outlook) as a change
+/// signal. It downloads nothing: every change it hears about asks the synchronizer for its
+/// regular API sync, which stays the only data path. The scheduled synchronization remains the
+/// fallback when IMAP is unavailable for the account.
+/// </summary>
+internal sealed class ImapMailboxChangeWatcher
 {
-    private const string GmailImapHost = "imap.gmail.com";
-    private const int GmailImapPort = 993;
+    private const int ImapPort = 993;
 
     // Gmail ends IDLE commands after about 30 minutes. Renewing earlier also exposes dead sockets.
     private static readonly TimeSpan IdleRenewInterval = TimeSpan.FromMinutes(9);
 
-    // Gmail reports one arrival as several untagged responses. The first one waits briefly so
-    // the History API already lists the change; later ones within the window share one sync.
-    private static readonly TimeSpan FirstChangeDelay = TimeSpan.FromSeconds(2);
-    private static readonly TimeSpan ChangeThrottleWindow = TimeSpan.FromSeconds(15);
+    // Servers report one arrival as several untagged responses; they share one sync. Requests
+    // stay this far apart so a burst of responses does not start a sync per response.
+    private static readonly TimeSpan FirstChangeDelay = TimeSpan.FromSeconds(1);
+    private static readonly TimeSpan MinimumRequestSpacing = TimeSpan.FromSeconds(3);
+
+    // IMAP can report a new message before the provider API lists it. A wake-up sync that finds
+    // nothing asks again after these delays, which keeps verification codes quick.
+    private static readonly TimeSpan[] FollowUpDelays = [TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(4), TimeSpan.FromSeconds(8)];
+    private static readonly TimeSpan PendingCheckInterval = TimeSpan.FromMilliseconds(500);
 
     private static readonly Random ReconnectJitter = new();
 
     private readonly MailAccount _account;
-    private readonly IGmailAuthenticator _authenticator;
+    private readonly ImapChangeWatcherConnection _connection;
     private readonly Action _changeDetected;
-    private readonly ILogger _logger = Log.ForContext<GmailImapChangeWatcher>();
+    private readonly ILogger _logger = Log.ForContext<ImapMailboxChangeWatcher>();
 
     private readonly SemaphoreSlim _lifecycle = new(1, 1);
     private readonly object _idleDoneLock = new();
@@ -47,13 +61,14 @@ internal sealed class GmailImapChangeWatcher
     private Task _loopTask;
     private Task _changeNotificationTask;
     private volatile bool _stopping;
-    private bool _changePending;
+    private DateTime? _nextRequestDueUtc;
     private DateTime _lastChangeRequestUtc = DateTime.MinValue;
+    private int _followUpAttempts;
 
-    public GmailImapChangeWatcher(MailAccount account, IGmailAuthenticator authenticator, Action changeDetected)
+    public ImapMailboxChangeWatcher(MailAccount account, ImapChangeWatcherConnection connection, Action changeDetected)
     {
         _account = account ?? throw new ArgumentNullException(nameof(account));
-        _authenticator = authenticator ?? throw new ArgumentNullException(nameof(authenticator));
+        _connection = connection ?? throw new ArgumentNullException(nameof(connection));
         _changeDetected = changeDetected ?? throw new ArgumentNullException(nameof(changeDetected));
     }
 
@@ -102,22 +117,50 @@ internal sealed class GmailImapChangeWatcher
                 _loopCancellationTokenSource?.Dispose();
                 _loopCancellationTokenSource = null;
                 _loopTask = null;
-                lock (_changeLock) _changePending = false;
+                lock (_changeLock)
+                {
+                    _nextRequestDueUtc = null;
+                    _followUpAttempts = 0;
+                }
             }
         }
         finally { _lifecycle.Release(); }
     }
 
     /// <summary>
-    /// Asks for a synchronization within the throttle window. The synchronizer also calls this when
-    /// it deferred a requested sync because another one was still pending.
+    /// Asks for a synchronization shortly. The synchronizer also calls this when it deferred a
+    /// requested sync because another one was still pending.
     /// </summary>
-    public void RequestSynchronization()
+    public void RequestSynchronization() => ScheduleRequest(FirstChangeDelay, isFollowUp: false);
+
+    /// <summary>
+    /// Called by the synchronizer when a wake-up sync found no history yet. Checks again a few
+    /// times with growing delays, until the next mailbox change starts a new round.
+    /// </summary>
+    public void RequestFollowUp() => ScheduleRequest(TimeSpan.Zero, isFollowUp: true);
+
+    private void ScheduleRequest(TimeSpan delay, bool isFollowUp)
     {
         lock (_changeLock)
         {
             if (_stopping || _loopCancellationTokenSource == null) return;
-            _changePending = true;
+
+            if (isFollowUp)
+            {
+                if (_followUpAttempts >= FollowUpDelays.Length) return;
+                delay = FollowUpDelays[_followUpAttempts++];
+            }
+            else
+            {
+                _followUpAttempts = 0;
+            }
+
+            var now = DateTime.UtcNow;
+            var due = now + delay;
+            var earliest = _lastChangeRequestUtc + MinimumRequestSpacing;
+            if (due < earliest) due = earliest;
+            if (_nextRequestDueUtc == null || due < _nextRequestDueUtc) _nextRequestDueUtc = due;
+
             _changeNotificationTask ??= Task.Run(FlushChangesAsync);
         }
     }
@@ -140,23 +183,26 @@ internal sealed class GmailImapChangeWatcher
 
             try
             {
-                await client.ConnectAsync(GmailImapHost, GmailImapPort, SecureSocketOptions.SslOnConnect, cancellationToken).ConfigureAwait(false);
+                var accessToken = await _connection.GetAccessTokenAsync(retriedAuthentication, cancellationToken).ConfigureAwait(false);
+                if (string.IsNullOrEmpty(accessToken))
+                {
+                    _logger.Information("{Provider} IMAP access is not granted for {AccountName}. Updates use scheduled synchronization.", _connection.ProviderName, _account.Name);
+                    return;
+                }
 
-                var token = retriedAuthentication
-                    ? await _authenticator.RefreshTokenInformationAsync(_account, cancellationToken: cancellationToken).ConfigureAwait(false)
-                    : await _authenticator.GetTokenInformationAsync(_account, cancellationToken: cancellationToken).ConfigureAwait(false);
-
-                await client.AuthenticateAsync(new SaslMechanismOAuth2(_account.Address, token.AccessToken), cancellationToken).ConfigureAwait(false);
+                await client.ConnectAsync(_connection.Host, ImapPort, SecureSocketOptions.SslOnConnect, cancellationToken).ConfigureAwait(false);
+                await client.AuthenticateAsync(new SaslMechanismOAuth2(_connection.GetUserName(), accessToken), cancellationToken).ConfigureAwait(false);
                 retriedAuthentication = false;
 
                 if (!client.Capabilities.HasFlag(ImapCapabilities.Idle))
                 {
-                    _logger.Information("Gmail IMAP did not offer IDLE for {AccountName}. Updates use scheduled synchronization.", _account.Name);
+                    _logger.Information("{Provider} IMAP did not offer IDLE for {AccountName}. Updates use scheduled synchronization.", _connection.ProviderName, _account.Name);
                     return;
                 }
 
-                // All Mail sees new mail that filters skip the inbox with and mail sent from other devices.
-                folder = GetWatchedFolder(client);
+                // Verification codes land in the Inbox, and Gmail signals Inbox changes sooner than
+                // All Mail changes. Mail that skips the Inbox waits for the scheduled synchronization.
+                folder = client.Inbox;
                 await folder.OpenAsync(FolderAccess.ReadOnly, cancellationToken).ConfigureAwait(false);
 
                 folder.CountChanged += FolderChanged;
@@ -166,7 +212,7 @@ internal sealed class GmailImapChangeWatcher
 
                 // Reconcile changes that arrived while this listener was disconnected.
                 if (reconnectAttempt > 0) RequestSynchronization();
-                _logger.Debug("Started Gmail IDLE watcher on {FolderName} for {AccountName}.", folder.FullName, _account.Name);
+                _logger.Debug("Started {Provider} IDLE watcher on {FolderName} for {AccountName}.", _connection.ProviderName, folder.FullName, _account.Name);
 
                 while (!cancellationToken.IsCancellationRequested && !_stopping && client.IsConnected)
                 {
@@ -200,29 +246,29 @@ internal sealed class GmailImapChangeWatcher
             catch (Exception ex) when (ex is MailKit.Security.AuthenticationException or SaslException)
             {
                 // An access token can expire between the cache check and the login. Retry once with a
-                // fresh one; a second rejection means IMAP is off for this account (for example by a
-                // Workspace admin), which does not affect the API synchronization.
+                // fresh one; a second rejection means IMAP is off for this account (for example by an
+                // organization admin), which does not affect the API synchronization.
                 if (!retriedAuthentication)
                 {
                     retriedAuthentication = true;
                     continue;
                 }
 
-                _logger.Information(ex, "Gmail IMAP sign-in was rejected for {AccountName}. Updates use scheduled synchronization.", _account.Name);
+                _logger.Information(ex, "{Provider} IMAP sign-in was rejected for {AccountName}. Updates use scheduled synchronization.", _connection.ProviderName, _account.Name);
                 return;
             }
             catch (ImapCommandException ex)
             {
-                _logger.Information(ex, "Gmail refused the IDLE watcher for {AccountName}. Updates use scheduled synchronization.", _account.Name);
+                _logger.Information(ex, "{Provider} refused the IDLE watcher for {AccountName}. Updates use scheduled synchronization.", _connection.ProviderName, _account.Name);
                 return;
             }
             catch (Exception ex) when (ex is IOException or ImapProtocolException or System.Net.Sockets.SocketException or OperationCanceledException)
             {
-                _logger.Debug(ex, "Gmail IDLE watcher lost its connection for {AccountName}.", _account.Name);
+                _logger.Debug(ex, "{Provider} IDLE watcher lost its connection for {AccountName}.", _connection.ProviderName, _account.Name);
             }
             catch (Exception ex)
             {
-                _logger.Warning(ex, "Gmail IDLE watcher failed for {AccountName}.", _account.Name);
+                _logger.Warning(ex, "{Provider} IDLE watcher failed for {AccountName}.", _connection.ProviderName, _account.Name);
             }
             finally
             {
@@ -242,7 +288,7 @@ internal sealed class GmailImapChangeWatcher
 
             reconnectAttempt++;
             var reconnectDelay = GetReconnectDelay(reconnectAttempt);
-            _logger.Debug("Reconnecting Gmail IDLE watcher for {AccountName} in {Delay}.", _account.Name, reconnectDelay);
+            _logger.Debug("Reconnecting {Provider} IDLE watcher for {AccountName} in {Delay}.", _connection.ProviderName, _account.Name, reconnectDelay);
 
             try
             {
@@ -253,24 +299,6 @@ internal sealed class GmailImapChangeWatcher
                 break;
             }
         }
-    }
-
-    private static IMailFolder GetWatchedFolder(ImapClient client)
-    {
-        // All Mail is missing when the user hid it from IMAP in Gmail settings.
-        if ((client.Capabilities & (ImapCapabilities.SpecialUse | ImapCapabilities.XList)) != 0)
-        {
-            try
-            {
-                var allMail = client.GetFolder(SpecialFolder.All);
-                if (allMail != null) return allMail;
-            }
-            catch (NotSupportedException)
-            {
-            }
-        }
-
-        return client.Inbox;
     }
 
     private static async Task DisconnectQuietlyAsync(ImapClient client)
@@ -288,7 +316,11 @@ internal sealed class GmailImapChangeWatcher
         }
     }
 
-    private void FolderChanged(object sender, EventArgs e) => RequestSynchronization();
+    private void FolderChanged(object sender, EventArgs e)
+    {
+        _logger.Debug("{Provider} IDLE reported {ChangeKind} for {AccountName}.", _connection.ProviderName, e.GetType().Name, _account.Name);
+        RequestSynchronization();
+    }
 
     private async Task FlushChangesAsync()
     {
@@ -296,36 +328,39 @@ internal sealed class GmailImapChangeWatcher
         {
             while (true)
             {
-                TimeSpan delay;
+                TimeSpan remaining;
                 CancellationToken token;
                 lock (_changeLock)
                 {
-                    if (!_changePending || _stopping || _loopCancellationTokenSource == null) return;
+                    if (_nextRequestDueUtc == null || _stopping || _loopCancellationTokenSource == null) return;
                     token = _loopCancellationTokenSource.Token;
-                    var throttleDelay = ChangeThrottleWindow - (DateTime.UtcNow - _lastChangeRequestUtc);
-                    delay = throttleDelay > FirstChangeDelay ? throttleDelay : FirstChangeDelay;
+                    remaining = _nextRequestDueUtc.Value - DateTime.UtcNow;
+
+                    if (remaining <= TimeSpan.Zero)
+                    {
+                        _nextRequestDueUtc = null;
+                        _lastChangeRequestUtc = DateTime.UtcNow;
+                    }
                 }
 
-                await Task.Delay(delay, token).ConfigureAwait(false);
-
-                lock (_changeLock)
+                if (remaining > TimeSpan.Zero)
                 {
-                    if (_stopping) return;
-                    _changePending = false;
-                    _lastChangeRequestUtc = DateTime.UtcNow;
+                    // Short waits notice when a newer request moved the due time earlier.
+                    await Task.Delay(remaining < PendingCheckInterval ? remaining : PendingCheckInterval, token).ConfigureAwait(false);
+                    continue;
                 }
 
                 _changeDetected();
             }
         }
         catch (OperationCanceledException) { }
-        catch (Exception ex) { _logger.Warning(ex, "Failed to request Gmail IDLE synchronization for {AccountName}.", _account.Name); }
+        catch (Exception ex) { _logger.Warning(ex, "Failed to request {Provider} IDLE synchronization for {AccountName}.", _connection.ProviderName, _account.Name); }
         finally
         {
             lock (_changeLock)
             {
                 _changeNotificationTask = null;
-                if (_changePending && !_stopping && _loopCancellationTokenSource != null)
+                if (_nextRequestDueUtc != null && !_stopping && _loopCancellationTokenSource != null)
                     _changeNotificationTask = Task.Run(FlushChangesAsync);
             }
         }

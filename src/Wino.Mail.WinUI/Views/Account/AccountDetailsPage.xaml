@@ -638,6 +638,21 @@
                 </controls:SettingsCard>
 
                 <controls:SettingsCard
+                    AutomationProperties.AutomationId="AccountDetailsInstantMailCard"
+                    Description="{x:Bind ViewModel.InstantMailDescription, Mode=OneWay}"
+                    Header="{x:Bind domain:Translator.SettingsInstantMail_Title, Mode=OneTime}"
+                    Visibility="{x:Bind ViewModel.IsInstantMailSupportedForAccount, Mode=OneWay}">
+                    <controls:SettingsCard.HeaderIcon>
+                        <coreControls:WinoFontIcon Icon="Pulse" />
+                    </controls:SettingsCard.HeaderIcon>
+
+                    <ToggleSwitch
+                        AutomationProperties.AutomationId="AccountDetailsInstantMailToggleSwitch"
+                        IsEnabled="{x:Bind helpers:XamlHelpers.ReverseBoolConverter(ViewModel.IsApplyingInstantMail), Mode=OneWay}"
+                        IsOn="{x:Bind ViewModel.IsInstantMailEnabled, Mode=TwoWay}" />
+                </controls:SettingsCard>
+
+                <controls:SettingsCard
                     AutomationProperties.AutomationId="AccountDetailsPageSettingsCard20"
                     Description="{x:Bind domain:Translator.SettingsAccountManagementAppendMessage_Description}"
                     Header="{x:Bind domain:Translator.SettingsAccountManagementAppendMessage_Title}"
