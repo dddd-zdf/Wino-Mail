@@ -68,7 +68,7 @@ public partial class WelcomePageV2ViewModel : MailBaseViewModel
             var result = await _syncService.ImportAsync(new WinoAccountSyncSelection(), PromptSyncSecretAsync).ConfigureAwait(false);
             if (result.ImportedMailboxCount > 0)
             {
-                ReportUIChange(new WelcomeImportCompletedMessage(result.ImportedMailboxCount, result.Appearance));
+                ReportUIChange(new WelcomeImportCompletedMessage(result.ImportedMailboxCount, result.Appearance, result.NeedsSignIn));
                 return;
             }
 
@@ -111,7 +111,7 @@ public partial class WelcomePageV2ViewModel : MailBaseViewModel
             var result = await _syncService.ImportFromFileAsync(fileContent, PromptSyncSecretAsync);
             if (result.ImportedMailboxCount > 0)
             {
-                ReportUIChange(new WelcomeImportCompletedMessage(result.ImportedMailboxCount, result.Appearance));
+                ReportUIChange(new WelcomeImportCompletedMessage(result.ImportedMailboxCount, result.Appearance, result.NeedsSignIn));
                 return;
             }
 

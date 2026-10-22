@@ -2138,10 +2138,13 @@ public partial class App : WinoApplication,
             await StartRuntimeAfterLaunchAsync();
             await UpdateJumpListOptionsSafeAsync();
 
-            Services.GetRequiredService<IMailDialogService>().InfoBarMessage(
-                Translator.GeneralTitle_Info,
-                Translator.WinoAccount_Management_ImportReloginReminder,
-                InfoBarMessageType.Information);
+            if (message.NeedsSignIn)
+            {
+                Services.GetRequiredService<IMailDialogService>().InfoBarMessage(
+                    Translator.GeneralTitle_Info,
+                    Translator.WinoAccount_Management_ImportReloginReminder,
+                    InfoBarMessageType.Information);
+            }
         });
     }
 

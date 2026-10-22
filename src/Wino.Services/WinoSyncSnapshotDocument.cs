@@ -33,6 +33,11 @@ internal sealed class WinoSyncSnapshotDocument
     /// </summary>
     public List<SnapshotAccountCapabilities>? AccountCapabilities { get; set; }
     public SyncSnapshotAppearance? Appearance { get; set; }
+
+    /// <summary>
+    /// Passwords of custom mailboxes. Only file backups the user opted into carry this section.
+    /// </summary>
+    public List<SnapshotAccountCredentials>? AccountCredentials { get; set; }
 }
 
 internal sealed class SnapshotTemplate
@@ -121,6 +126,20 @@ internal sealed class SnapshotAccountCapabilities
     public string? CardDavServiceUrl { get; set; }
     public bool IsTasksEnabled { get; set; }
     public int TaskIntegrationSource { get; set; }
+}
+
+internal sealed class SnapshotAccountCredentials
+{
+    public string AccountAddress { get; set; } = string.Empty;
+    public int ProviderType { get; set; }
+    public string? IncomingServerPassword { get; set; }
+    public string? OutgoingServerPassword { get; set; }
+
+    /// <summary>
+    /// DAV password. CardDAV keeps its own copy outside the server settings; it travels here
+    /// when the server settings no longer hold one.
+    /// </summary>
+    public string? CalDavPassword { get; set; }
 }
 
 internal sealed class SnapshotMailboxReference

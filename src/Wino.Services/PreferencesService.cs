@@ -8,6 +8,7 @@ using System.Text;
 using System.Text.Json;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Messaging;
+using Serilog;
 using Wino.Core.Domain;
 using Wino.Core.Domain.Enums;
 using Wino.Core.Domain.Interfaces;
@@ -113,8 +114,9 @@ public partial class PreferencesService(IConfigurationService configurationServi
                 property.Setter(this, ReadPreferenceValue(property.PropertyType, value));
                 appliedCount++;
             }
-            catch (Exception)
+            catch (Exception ex)
             {
+                Log.Warning(ex, "Imported preference {PreferenceName} could not be applied.", property.Name);
                 failedCount++;
             }
         }

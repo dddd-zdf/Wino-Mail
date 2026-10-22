@@ -57,6 +57,13 @@ public partial class BackupRestorePageViewModel : CoreBaseViewModel,
     [NotifyCanExecuteChangedFor(nameof(ImportFromWinoAccountCommand))]
     public partial bool IsWinoAccountSignedIn { get; set; }
 
+    /// <summary>
+    /// Puts account passwords in the next file backup. Starts off on every visit and never
+    /// applies to the Wino Account backup.
+    /// </summary>
+    [ObservableProperty]
+    public partial bool IncludePasswordsInFileBackup { get; set; }
+
     public override void OnNavigatedTo(NavigationMode mode, object parameters)
     {
         base.OnNavigatedTo(mode, parameters);
@@ -205,7 +212,8 @@ public partial class BackupRestorePageViewModel : CoreBaseViewModel,
 
             await ExecuteUIThread(() => IsDataTransferInProgress = true);
 
-            var exportResult = await _syncService.ExportToFileAsync(new(), PromptSyncSecretAsync).ConfigureAwait(false);
+            var selection = new WinoAccountSyncSelection(IncludeCredentials: IncludePasswordsInFileBackup);
+            var exportResult = await _syncService.ExportToFileAsync(selection, PromptSyncSecretAsync).ConfigureAwait(false);
             await File.WriteAllBytesAsync(exportPath, exportResult.Content).ConfigureAwait(false);
 
             _dialogService.InfoBarMessage(
@@ -308,6 +316,11 @@ public partial class BackupRestorePageViewModel : CoreBaseViewModel,
             parts.Add(Translator.WinoAccount_Management_ExportSucceeded);
         }
 
+        if (result.ExportedCredentialCount > 0)
+        {
+            parts.Add(string.Format(Translator.WinoAccount_Management_ExportCredentialsIncluded, result.ExportedCredentialCount));
+        }
+
         return string.Join(" ", parts);
     }
 
@@ -347,7 +360,7 @@ public partial class BackupRestorePageViewModel : CoreBaseViewModel,
             parts.Add(Translator.WinoAccount_Management_ImportEmpty);
         }
 
-        if (result.ImportedMailboxCount > 0)
+        if (result.NeedsSignIn)
         {
             parts.Add(Translator.WinoAccount_Management_ImportReloginReminder);
         }
