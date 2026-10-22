@@ -197,7 +197,7 @@ internal sealed class GmailImapChangeWatcher
                 // The API synchronization owns sign-in problems and shows them to the user.
                 return;
             }
-            catch (Exception ex) when (ex is AuthenticationException or SaslException)
+            catch (Exception ex) when (ex is MailKit.Security.AuthenticationException or SaslException)
             {
                 // An access token can expire between the cache check and the login. Retry once with a
                 // fresh one; a second rejection means IMAP is off for this account (for example by a
